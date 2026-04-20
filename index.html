@@ -1635,11 +1635,11 @@
     updateDetectedType('');
   }
 
-  function deleteRegistro(id) {
+  async function deleteRegistro(id) {
     // Si es histórico, pedir clave
     if (id.startsWith('hist-')) {
       const clave = prompt('🔒 Ingresa la clave para eliminar este registro histórico:');
-      if (clave === null) return; // canceló
+      if (clave === null) return;
       if (clave !== '1234') {
         toast('❌ Clave incorrecta', 'danger');
         beep(300, 'warning');
@@ -1653,13 +1653,47 @@
       toast('Registro histórico eliminado', 'success');
       return;
     }
-    // Registro nuevo normal
-    if (!confirm('¿Eliminar este registro?')) return;
+
+    // Registro nuevo (despacho de la sesión actual)
+    const reg = state.registrosNuevos.find(r => r.id === id);
+    if (!reg) return;
+
+    // Verificar si este termógrafo está en inventario (para devolverlo)
+    const itemInv = inventarioState.items.find(i => i.serie === reg.serie && i.despachado);
+    let mensajeConfirm = `¿Eliminar el despacho de ${reg.serie}?`;
+    if (itemInv) {
+      mensajeConfirm += `\n\n✅ El termógrafo volverá al inventario como DISPONIBLE y podrá ser despachado nuevamente.`;
+    } else if (reg.fueraInv) {
+      mensajeConfirm += `\n\n⚠️ Este termógrafo se despachó SIN estar en el inventario (no se devuelve nada).`;
+    }
+    if (!confirm(mensajeConfirm)) return;
+
+    // 1. Eliminar el despacho
     state.registrosNuevos = state.registrosNuevos.filter(r => r.id !== id);
+
+    // 2. Devolver al inventario si aplica
+    let devuelto = false;
+    if (itemInv) {
+      itemInv.despachado = false;
+      itemInv.despachadoEn = null;
+      devuelto = true;
+      // Sincronizar con Firebase
+      if (fbInitialized) {
+        await fbUpsertItem(itemInv);
+      }
+    }
+
     rebuildRegistros();
     saveState();
+    saveInventario();
     renderAll();
-    toast('Registro eliminado', 'success');
+
+    if (devuelto) {
+      toast(`✅ ${reg.serie} eliminado y devuelto al inventario`, 'success');
+    } else {
+      toast(`Despacho de ${reg.serie} eliminado`, 'success');
+    }
+    beep(150, 'success');
   }
 
   function clearSession() {
