@@ -9,6 +9,33 @@
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script type="module">
+  // Firebase SDK - Firestore
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, writeBatch, getDocs }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyA1iILvyRsMs2D7MfxCGMgWajciYBGF5KA",
+    authDomain: "despacho-termografos.firebaseapp.com",
+    databaseURL: "https://despacho-termografos-default-rtdb.firebaseio.com",
+    projectId: "despacho-termografos",
+    storageBucket: "despacho-termografos.firebasestorage.app",
+    messagingSenderId: "1030821713945",
+    appId: "1:1030821713945:web:c211001562e7a8386b3288"
+  };
+
+  const fbApp = initializeApp(firebaseConfig);
+  const db = getFirestore(fbApp);
+
+  // Exponer helpers al scope global para que el resto del script los use
+  window.fbDB = db;
+  window.fbHelpers = {
+    collection, doc, setDoc, deleteDoc, onSnapshot, writeBatch, getDocs
+  };
+  window.fbReady = true;
+  window.dispatchEvent(new Event('firebase-ready'));
+</script>
 <style>
   :root {
     /* Paleta Tropical Fruit Export — verde claro + blanco */
@@ -1059,6 +1086,10 @@
     </div>
     <div class="header-status">
       <div class="current-date" id="currentDate">—</div>
+      <div id="fbStatus" class="scanner-status" style="background: #b8ceaf; color: #1f3a1a;" title="Conectando a la nube...">
+        <span class="status-dot" style="background: #f5c518; box-shadow: 0 0 10px #f5c518;"></span>
+        <span>Conectando nube...</span>
+      </div>
       <div class="scanner-status">
         <span class="status-dot"></span>
         <span>Escáner listo</span>
@@ -1591,6 +1622,11 @@
     saveState();
     saveInventario();
     renderAll();
+
+    // Sincronizar el item despachado con Firebase
+    if (!fueraDeInventario && item && fbInitialized) {
+      fbUpsertItem(item);  // actualiza despachado=true en la nube
+    }
 
     if (!fueraDeInventario) {
       toast(`${reg.tipo} · ${reg.serie} despachado`, 'success');
@@ -2135,13 +2171,12 @@
   }
 
   // ============================================
-  // INVENTARIO
+  // INVENTARIO (sincronizado con Firebase Firestore)
   // ============================================
-  const INV_STORAGE = 'tfe_inventario_v1';
-  const UMBRAL_STORAGE = 'tfe_umbrales_v1';
+  const INV_STORAGE = 'tfe_inventario_v1';       // fallback local
+  const UMBRAL_STORAGE = 'tfe_umbrales_v1';      // fallback local
   const TIPOS_INV = ['TT ULTRA', 'RADIOFRECUENCIA', 'EMERSON', 'EMERSON USB'];
 
-  // Umbrales por defecto (basados en los inventarios típicos que veo en el Excel)
   const UMBRALES_DEFAULT = {
     'TT ULTRA': 30,
     'RADIOFRECUENCIA': 100,
@@ -2150,32 +2185,172 @@
   };
 
   let inventarioState = {
-    items: [],              // array de {serie, tipo, lote, nota, timestamp, despachado, despachadoEn}
+    items: [],
     umbrales: { ...UMBRALES_DEFAULT },
-    scanSession: null       // sesión activa de escaneo (modal abierto)
+    scanSession: null
   };
 
-  // Cargar estado del inventario
+  // Cargar primero del cache local (para mostrar algo rápido si no hay internet)
   try {
     const saved = localStorage.getItem(INV_STORAGE);
     if (saved) {
       const loaded = JSON.parse(saved);
-      if (loaded && Array.isArray(loaded.items)) {
-        inventarioState.items = loaded.items;
-      }
+      if (loaded && Array.isArray(loaded.items)) inventarioState.items = loaded.items;
     }
     const savedUmb = localStorage.getItem(UMBRAL_STORAGE);
     if (savedUmb) {
       const umb = JSON.parse(savedUmb);
       inventarioState.umbrales = { ...UMBRALES_DEFAULT, ...umb };
     }
-  } catch(e) { console.warn('No se pudo cargar inventario'); }
+  } catch(e) { console.warn('No se pudo cargar cache local'); }
 
+  // ============================================
+  // FIREBASE: sincronización en tiempo real
+  // ============================================
+  let fbInitialized = false;
+  let fbUnsubInv = null;
+  let fbUnsubUmb = null;
+
+  function setFbStatus(state, msg) {
+    const el = document.getElementById('fbStatus');
+    if (!el) return;
+    const dot = el.querySelector('.status-dot');
+    const txt = el.querySelector('span:last-child');
+    if (state === 'connected') {
+      el.style.background = '#b8ceaf';
+      el.style.color = '#1f3a1a';
+      dot.style.background = '#5ba327';
+      dot.style.boxShadow = '0 0 10px #5ba327';
+      txt.textContent = msg || 'Nube conectada';
+      el.title = '✅ Datos sincronizados con Firebase';
+    } else if (state === 'error') {
+      el.style.background = '#fce8e8';
+      el.style.color = '#d64545';
+      dot.style.background = '#d64545';
+      dot.style.boxShadow = '0 0 10px #d64545';
+      txt.textContent = msg || 'Sin conexión nube';
+      el.title = '⚠️ Trabajando en modo local (los datos solo se guardan en este navegador)';
+    } else {
+      txt.textContent = msg || 'Conectando nube...';
+    }
+  }
+
+  function initFirebase() {
+    if (!window.fbReady || !window.fbDB) {
+      setFbStatus('error', 'Sin conexión nube');
+      toast('⚠️ No se pudo conectar a Firebase. Trabajando en modo local.', 'warning');
+      return;
+    }
+    const { collection, doc, setDoc, deleteDoc, onSnapshot } = window.fbHelpers;
+    const db = window.fbDB;
+
+    try {
+      // Escuchar cambios en inventario (colección "inventario")
+      fbUnsubInv = onSnapshot(collection(db, 'inventario'), (snap) => {
+        const items = [];
+        snap.forEach(d => items.push(d.data()));
+        inventarioState.items = items;
+        // Cache local como respaldo
+        try {
+          localStorage.setItem(INV_STORAGE, JSON.stringify({ items }));
+        } catch(e) {}
+        // Re-renderizar si estamos en la vista de inventario
+        if (!document.getElementById('view-inventory').classList.contains('hidden')) {
+          renderInventory();
+        }
+      }, (err) => {
+        console.error('Error sync inventario:', err);
+        setFbStatus('error', 'Error sync');
+      });
+
+      // Escuchar cambios en umbrales (doc único)
+      fbUnsubUmb = onSnapshot(doc(db, 'config', 'umbrales'), (snap) => {
+        if (snap.exists()) {
+          inventarioState.umbrales = { ...UMBRALES_DEFAULT, ...snap.data() };
+          try {
+            localStorage.setItem(UMBRAL_STORAGE, JSON.stringify(inventarioState.umbrales));
+          } catch(e) {}
+          if (!document.getElementById('view-inventory').classList.contains('hidden')) {
+            renderInventory();
+          }
+        }
+      });
+
+      fbInitialized = true;
+      setFbStatus('connected', 'Nube conectada');
+    } catch(err) {
+      console.error('Firebase init error:', err);
+      setFbStatus('error', 'Error nube');
+      toast('⚠️ Error al conectar con Firebase. Modo local activado.', 'warning');
+    }
+  }
+
+  // Si el SDK ya está cargado, inicializar ahora; si no, esperar el evento
+  if (window.fbReady) {
+    setTimeout(initFirebase, 100);
+  } else {
+    window.addEventListener('firebase-ready', initFirebase);
+  }
+
+  // ============ API de Firebase para inventario ============
+  async function fbUpsertItem(item) {
+    if (!fbInitialized) return false;
+    try {
+      const { doc, setDoc } = window.fbHelpers;
+      await setDoc(doc(window.fbDB, 'inventario', item.serie), item);
+      return true;
+    } catch(err) {
+      console.error('Error guardar item:', err);
+      return false;
+    }
+  }
+
+  async function fbUpsertItems(items) {
+    if (!fbInitialized) return false;
+    try {
+      const { doc, writeBatch } = window.fbHelpers;
+      const batch = writeBatch(window.fbDB);
+      items.forEach(item => {
+        batch.set(doc(window.fbDB, 'inventario', item.serie), item);
+      });
+      await batch.commit();
+      return true;
+    } catch(err) {
+      console.error('Error batch items:', err);
+      return false;
+    }
+  }
+
+  async function fbDeleteItem(serie) {
+    if (!fbInitialized) return false;
+    try {
+      const { doc, deleteDoc } = window.fbHelpers;
+      await deleteDoc(doc(window.fbDB, 'inventario', serie));
+      return true;
+    } catch(err) {
+      console.error('Error eliminar item:', err);
+      return false;
+    }
+  }
+
+  async function fbSaveUmbrales(umbrales) {
+    if (!fbInitialized) return false;
+    try {
+      const { doc, setDoc } = window.fbHelpers;
+      await setDoc(doc(window.fbDB, 'config', 'umbrales'), umbrales);
+      return true;
+    } catch(err) {
+      console.error('Error guardar umbrales:', err);
+      return false;
+    }
+  }
+
+  // Mantiene la API vieja por compatibilidad (cache local como respaldo)
   function saveInventario() {
     try {
       localStorage.setItem(INV_STORAGE, JSON.stringify({ items: inventarioState.items }));
       localStorage.setItem(UMBRAL_STORAGE, JSON.stringify(inventarioState.umbrales));
-    } catch(e) { console.warn('No se pudo guardar inventario'); }
+    } catch(e) { console.warn('No se pudo guardar cache local'); }
   }
 
   // Calcular stock: cuenta items escaneados e items despachados
@@ -2300,7 +2475,7 @@
     `;
   }
 
-  function deleteInvItem(serie) {
+  async function deleteInvItem(serie) {
     const item = inventarioState.items.find(i => i.serie === serie);
     if (!item) return;
     if (item.despachado) {
@@ -2311,6 +2486,7 @@
     inventarioState.items = inventarioState.items.filter(i => i.serie !== serie);
     saveInventario();
     renderInventory();
+    if (fbInitialized) await fbDeleteItem(serie);
     toast(`${serie} eliminado del inventario`, 'success');
   }
 
@@ -2421,7 +2597,7 @@
     toast('Escaneo descartado', 'warning');
   }
 
-  function finalizarEscaneoInv() {
+  async function finalizarEscaneoInv() {
     const s = inventarioState.scanSession;
     if (!s || s.escaneados.length === 0) {
       toast('No hay nada que guardar', 'warning');
@@ -2431,25 +2607,36 @@
     const ts = now.toISOString();
     const fecha = formatDate(now);
 
-    s.escaneados.forEach(serie => {
-      inventarioState.items.push({
-        serie: serie,
-        tipo: s.tipo,
-        lote: s.lote,
-        nota: s.nota,
-        timestamp: ts,
-        fecha: fecha,
-        despachado: false,
-        despachadoEn: null
-      });
-    });
+    const nuevosItems = s.escaneados.map(serie => ({
+      serie: serie,
+      tipo: s.tipo,
+      lote: s.lote,
+      nota: s.nota || '',
+      timestamp: ts,
+      fecha: fecha,
+      despachado: false,
+      despachadoEn: null
+    }));
 
+    // Agregar al estado local de inmediato (optimistic update)
+    nuevosItems.forEach(item => inventarioState.items.push(item));
     saveInventario();
-    const cant = s.escaneados.length;
+    const cant = nuevosItems.length;
     const tipo = s.tipo;
     closeEscanearInvModal();
     renderInventory();
-    toast(`✅ ${cant} ${tipo} agregados al inventario`, 'success');
+
+    // Subir a Firebase en batch
+    if (fbInitialized) {
+      const ok = await fbUpsertItems(nuevosItems);
+      if (ok) {
+        toast(`✅ ${cant} ${tipo} agregados al inventario (nube ✓)`, 'success');
+      } else {
+        toast(`⚠️ ${cant} ${tipo} guardados localmente. Error al sincronizar.`, 'warning');
+      }
+    } else {
+      toast(`✅ ${cant} ${tipo} agregados al inventario (modo local)`, 'success');
+    }
     beep(200, 'success');
   }
 
@@ -2465,7 +2652,7 @@
     document.getElementById('umbralesModal').classList.remove('show');
   }
 
-  function guardarUmbrales() {
+  async function guardarUmbrales() {
     inventarioState.umbrales = {
       'TT ULTRA': parseInt(document.getElementById('umbralTTU').value) || 0,
       'RADIOFRECUENCIA': parseInt(document.getElementById('umbralRF').value) || 0,
@@ -2475,6 +2662,7 @@
     saveInventario();
     closeUmbralesModal();
     renderInventory();
+    if (fbInitialized) await fbSaveUmbrales(inventarioState.umbrales);
     toast('Umbrales actualizados', 'success');
   }
 
